@@ -1,0 +1,43 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install main dependencies
+        run: npm ci
+
+      - name: Build Expo web bundle
+        run: npx expo export --platform web --output-dir desktop/web-build --clear
+        env:
+          CI: true
+
+      - name: Install Electron dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build Windows installer
+        working-directory: desktop
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MimicAlgo-Windows-Installer
+          path: desktop/dist/*.exe
+          retention-days: 30
