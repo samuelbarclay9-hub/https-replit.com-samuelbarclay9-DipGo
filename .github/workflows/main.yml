@@ -115,6 +115,14 @@ jobs:
           PY
           python run_inference.py
 
+      - name: Bundle exact Kronos source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/vendor/Kronos
+          cp -a kronos-src/. artifacts/vendor/Kronos/
+          git -C kronos-src rev-parse HEAD > artifacts/vendor/Kronos/SOURCE_COMMIT.txt
+
       - name: Upload verified artifacts
         uses: actions/upload-artifact@v4
         with:
