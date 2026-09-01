@@ -1,0 +1,141 @@
+name: TradeFlow V097 Model Artifact Probe
+
+on:
+  push:
+    branches:
+      - tradeflow-v097-model-artifact-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  verify-and-infer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas safetensors huggingface_hub pillow opencv-python-headless
+          python -m pip install "git+https://github.com/ultralytics/ultralytics.git@878d385caa6bf30a2158d41f0b1d46e64b078748"
+          git clone https://github.com/shiyu-coder/Kronos.git kronos-src
+          git -C kronos-src checkout --detach 67b630e67f6a18c9e9be918d9b4337c960db1e9a
+          python -m pip install -r kronos-src/requirements.txt
+
+      - name: Download exact gated artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/Kronos-mini artifacts/Kronos-Tokenizer-2k artifacts/foduu
+          curl -L --fail --retry 5 --retry-all-errors             "https://raw.githubusercontent.com/dahaini08-spec/brahma-quant/c2f67462518bdaef5edd8b7020d1e8e376d3c495/data/kronos_cache/models--NeoQuasar--Kronos-mini/blobs/a7d5f37e2e9fbd9891f7d7d4f72574512dd1f704fee14223e0a8cd0fbf54197c"             -o artifacts/Kronos-mini/model.safetensors
+          curl -L --fail --retry 5 --retry-all-errors             "https://raw.githubusercontent.com/Yechang618/kronos_test/155f8dbeae4769f330d8bbbccc6412b327f32f90/finetune_csv/model/Kronos-mini/config.json"             -o artifacts/Kronos-mini/config.json
+          curl -L --fail --retry 5 --retry-all-errors             "https://media.githubusercontent.com/media/Yechang618/kronos_test/155f8dbeae4769f330d8bbbccc6412b327f32f90/finetune_csv/model/Kronos-Tokenizer-2k/model.safetensors"             -o artifacts/Kronos-Tokenizer-2k/model.safetensors
+          curl -L --fail --retry 5 --retry-all-errors             "https://raw.githubusercontent.com/Yechang618/kronos_test/155f8dbeae4769f330d8bbbccc6412b327f32f90/finetune_csv/model/Kronos-Tokenizer-2k/config.json"             -o artifacts/Kronos-Tokenizer-2k/config.json
+          curl -L --fail --retry 5 --retry-all-errors             "https://huggingface.co/foduucom/stockmarket-pattern-detection-yolov8/resolve/9ac954b2f1a9b66c086381204e8c0710bce41ed4/model.pt?download=true"             -o artifacts/foduu/model.pt
+
+      - name: Verify SHA-256 gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "a7d5f37e2e9fbd9891f7d7d4f72574512dd1f704fee14223e0a8cd0fbf54197c  artifacts/Kronos-mini/model.safetensors" | sha256sum -c -
+          echo "b97ec46b3b72160509e289183eaf7bdf5f0dac5bb9b49522f6d46638a99a8717  artifacts/Kronos-Tokenizer-2k/model.safetensors" | sha256sum -c -
+          echo "3c93ebc30b60244f4a03bf8cf9d6b5e714b8ab3ffbb714cc5864ad8efb3651d0  artifacts/foduu/model.pt" | sha256sum -c -
+          sha256sum artifacts/Kronos-mini/model.safetensors artifacts/Kronos-Tokenizer-2k/model.safetensors artifacts/foduu/model.pt > artifacts/SHA256SUMS.txt
+          wc -c artifacts/Kronos-mini/model.safetensors artifacts/Kronos-Tokenizer-2k/model.safetensors artifacts/foduu/model.pt > artifacts/SIZES.txt
+
+      - name: Run real Kronos and FODUU inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > run_inference.py <<'PY'
+          import json, math, sys, hashlib
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from PIL import Image, ImageDraw
+
+          root = Path.cwd()
+          sys.path.insert(0, str(root / "kronos-src"))
+          from model import Kronos, KronosTokenizer, KronosPredictor
+
+          tok = KronosTokenizer.from_pretrained(str(root / "artifacts/Kronos-Tokenizer-2k"))
+          mod = Kronos.from_pretrained(str(root / "artifacts/Kronos-mini"))
+          pred = KronosPredictor(mod, tok, max_context=2048)
+
+          n=96
+          idx=np.arange(n,dtype=float)
+          close=100.0 + 0.08*idx + 0.7*np.sin(idx/7.0)
+          open_=close + 0.12*np.sin(idx/3.0)
+          high=np.maximum(open_,close)+0.35
+          low=np.minimum(open_,close)-0.35
+          volume=1000.0 + 10.0*idx + 120*np.sin(idx/5.0)**2
+          amount=volume*close
+          df=pd.DataFrame({"open":open_,"high":high,"low":low,"close":close,"volume":volume,"amount":amount})
+          x_ts=pd.Series(pd.date_range("2026-08-31T12:00:00Z", periods=n, freq="5min"))
+          y_ts=pd.Series(pd.date_range(x_ts.iloc[-1] + pd.Timedelta(minutes=5), periods=3, freq="5min"))
+          out=pred.predict(df=df,x_timestamp=x_ts,y_timestamp=y_ts,pred_len=3,T=1.0,top_p=0.9,sample_count=3)
+          kronos_closes=[float(x) for x in out["close"].tolist()]
+          if len(kronos_closes)!=3 or not all(math.isfinite(x) and x>0 for x in kronos_closes):
+              raise RuntimeError(f"invalid Kronos output: {kronos_closes}")
+
+          # Build a deterministic synthetic candlestick image only as visual input;
+          # the inference itself is the real downloaded FODUU network.
+          img=Image.new("RGB",(960,540),(18,18,22))
+          d=ImageDraw.Draw(img)
+          pad=30; price_h=400
+          lo=float(low.min()); hi=float(high.max()); rng=hi-lo
+          slot=(960-2*pad)/n
+          for i,(o,h,l,c) in enumerate(zip(open_,high,low,close)):
+              x=pad+(i+.5)*slot
+              y=lambda p: pad+(hi-float(p))/rng*price_h
+              col=(46,204,113) if c>=o else (239,83,80)
+              d.line((x,y(l),x,y(h)),fill=col,width=1)
+              d.rectangle((x-2,min(y(o),y(c)),x+2,max(y(o),y(c))+1),fill=col)
+          visual_path=root/"artifacts/foduu/probe.png"
+          img.save(visual_path)
+
+          from ultralytics import YOLO
+          yolo=YOLO(str(root/"artifacts/foduu/model.pt"))
+          res=yolo(str(visual_path),verbose=False,conf=0.10,iou=0.45,max_det=50)[0]
+          names=getattr(res,"names",{}) or {}
+          boxes=getattr(res,"boxes",None)
+          detections=[]
+          if boxes is not None:
+              for cls,cf in zip(boxes.cls.tolist(),boxes.conf.tolist()):
+                  detections.append({"class_id":int(cls),"label":str(names.get(int(cls),int(cls))),"confidence":float(cf)})
+          # A valid real forward pass may legitimately return zero detections.
+          report={
+              "kronos":{
+                  "loaded":True,
+                  "inference_passed":True,
+                  "predicted_close":kronos_closes,
+                  "input_rows":n,
+                  "model_type":type(mod).__name__,
+                  "tokenizer_type":type(tok).__name__,
+              },
+              "foduu":{
+                  "loaded":True,
+                  "inference_passed":True,
+                  "detections":detections,
+                  "class_names":{str(k):str(v) for k,v in names.items()},
+                  "result_type":type(res).__name__,
+              }
+          }
+          (root/"artifacts/REAL_INFERENCE_REPORT.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+          print(json.dumps(report,indent=2))
+          PY
+          python run_inference.py
+
+      - name: Upload verified model artifacts and inference report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradeflow-v097-verified-model-artifacts
+          path: artifacts
+          retention-days: 7
+          if-no-files-found: error
